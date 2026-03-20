@@ -67,7 +67,7 @@ Telegram-бот, который превращает Telegram в личную т
 - `assistant-bot.service` — основной бот
 - `ssh-proxy-tunnel.service` — пример unit-файла для SSH SOCKS5 туннеля
 
-`assistant-bot.service` стартует из директории проекта, читает секреты из `assistant-bot.env`, работает с автоперезапуском и использует локальный HTTP-прокси `127.0.0.1:8118`.
+`assistant-bot.service` стартует из директории проекта, читает настройки из `assistant-bot.env` и работает с автоперезапуском. Прокси не зашит в unit-файл: при необходимости его можно задать через переменные окружения в `assistant-bot.env`.
 
 В коде дополнительно есть watchdog: если Telegram API недоступен слишком долго, процесс завершается, а `systemd` поднимает его заново.
 
@@ -92,6 +92,12 @@ cp assistant-bot.env.example assistant-bot.env
 ```env
 BOT_TOKEN=<telegram bot token>
 ALLOWED_USER_ID=<telegram user id>
+
+# Optional proxy settings
+# http_proxy=http://127.0.0.1:8118
+# https_proxy=http://127.0.0.1:8118
+# HTTP_PROXY=http://127.0.0.1:8118
+# HTTPS_PROXY=http://127.0.0.1:8118
 ```
 
 Права на файл должны быть ограничены:
@@ -99,6 +105,8 @@ ALLOWED_USER_ID=<telegram user id>
 ```bash
 chmod 600 assistant-bot.env
 ```
+
+Если прокси не нужен, строки `http_proxy` / `https_proxy` можно не добавлять вовсе. Если нужен свой прокси, просто укажите его в `assistant-bot.env` без правок `assistant-bot.service`.
 
 ## Требования
 
@@ -108,7 +116,7 @@ chmod 600 assistant-bot.env
 - Python-библиотеки, которые использует `bot.py`
 - `ffmpeg`
 - `claude` CLI
-- доступный локальный HTTP-прокси на `127.0.0.1:8118`
+- при необходимости HTTP(S)-прокси, который можно указать в `assistant-bot.env`
 - настроенный SSH host alias, если вы используете `ssh-proxy-tunnel.service`
 
 ## Установка systemd service
