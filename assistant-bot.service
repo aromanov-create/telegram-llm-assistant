@@ -1,0 +1,24 @@
+[Unit]
+Description=Telegram Assistant Bot
+After=network-online.target ssh-proxy-tunnel.service
+Wants=network-online.target ssh-proxy-tunnel.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/andrey/Projects/my-assistant
+EnvironmentFile=/home/andrey/Projects/my-assistant/assistant-bot.env
+Environment=http_proxy=http://127.0.0.1:8118
+Environment=https_proxy=http://127.0.0.1:8118
+Environment=HTTP_PROXY=http://127.0.0.1:8118
+Environment=HTTPS_PROXY=http://127.0.0.1:8118
+Environment=ALL_PROXY=
+Environment=all_proxy=
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/andrey/Projects/my-assistant/bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
