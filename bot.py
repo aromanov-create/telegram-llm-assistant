@@ -482,6 +482,10 @@ def main() -> None:
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(30)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
