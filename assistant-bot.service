@@ -5,6 +5,8 @@ Wants=network-online.target ssh-proxy-tunnel.service
 
 [Service]
 Type=simple
+User=andrey
+Group=andrey
 WorkingDirectory=/home/andrey/Projects/my-assistant
 EnvironmentFile=/home/andrey/Projects/my-assistant/assistant-bot.env
 Environment=PYTHONUNBUFFERED=1
