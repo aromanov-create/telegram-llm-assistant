@@ -185,7 +185,7 @@ async def _run_claude_proc(args: list[str]) -> str:
 async def run_claude(prompt: str) -> str:
     full_prompt = build_prompt(prompt)
     return await _run_claude_proc(
-        ["claude", "--print", "--dangerously-skip-permissions", full_prompt]
+        ["/home/andrey/.local/bin/claude", "--print", "--dangerously-skip-permissions", full_prompt]
     )
 
 
@@ -194,7 +194,7 @@ async def run_claude_vision(prompt: str, image_path: str) -> str:
         f"Изображение сохранено в файл: {image_path}\nПрочитай этот файл и выполни задание.\n{prompt}"
     )
     return await _run_claude_proc(
-        ["claude", "--print", "--dangerously-skip-permissions", full_prompt]
+        ["/home/andrey/.local/bin/claude", "--print", "--dangerously-skip-permissions", full_prompt]
     )
 
 
