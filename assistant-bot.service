@@ -8,9 +8,11 @@ Type=simple
 WorkingDirectory=/home/andrey/Projects/my-assistant
 EnvironmentFile=/home/andrey/Projects/my-assistant/assistant-bot.env
 Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/bash -lc 'for i in {1..10}; do curl --proxy http://127.0.0.1:8118 -fsS --max-time 15 https://api.telegram.org >/dev/null && exit 0; sleep 3; done; exit 1'
 ExecStart=/usr/bin/python3 /home/andrey/Projects/my-assistant/bot.py
 Restart=always
 RestartSec=5
+TimeoutStartSec=90
 StandardOutput=journal
 StandardError=journal
 

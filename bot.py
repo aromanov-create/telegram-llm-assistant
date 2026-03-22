@@ -61,7 +61,7 @@ class WhisperResult(TypedDict):
     text: str
 
 
-MAX_HISTORY = 10
+MAX_HISTORY = 20
 conversation_history: list[HistoryEntry] = []
 TELEGRAM_HEALTHCHECK_INTERVAL = 60
 TELEGRAM_MAX_UNHEALTHY_SECONDS = 300
@@ -131,7 +131,7 @@ def build_prompt(user_text: str) -> str:
     return f"{system}\n\n{history_block}Запрос: {user_text}"
 
 
-CLAUDE_TIMEOUT = 300
+CLAUDE_TIMEOUT = 600
 MAX_MSG_LEN = 4000
 PROGRESS_INTERVAL = 30
 
@@ -452,10 +452,10 @@ async def telegram_watchdog(app: Application[Any, Any, Any, Any, Any, Any]) -> N
             )
             if unhealthy_for >= TELEGRAM_MAX_UNHEALTHY_SECONDS:
                 logger.error(
-                    "Telegram недоступен слишком долго (%sс), завершаю процесс для рестарта systemd",
+                    "Telegram недоступен слишком долго (%sс), аварийно завершаю процесс для рестарта systemd",
                     unhealthy_for,
                 )
-                raise SystemExit(1)
+                os._exit(1)
 
 
 async def post_init(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
@@ -482,10 +482,11 @@ def main() -> None:
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(60)
-        .write_timeout(60)
-        .pool_timeout(30)
+        .connection_pool_size(20)
+        .connect_timeout(60)
+        .read_timeout(90)
+        .write_timeout(90)
+        .pool_timeout(90)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
