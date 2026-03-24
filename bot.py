@@ -9,14 +9,15 @@ import asyncio
 import datetime
 import logging
 import os
+import socket
 import tempfile
 import time
 from functools import partial
 from typing import Any, Awaitable, TypedDict, TypeVar, cast
 
 import whisper
-from telegram import Message, Update, User
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User
+from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -63,8 +64,10 @@ class WhisperResult(TypedDict):
 
 MAX_HISTORY = 20
 conversation_history: list[HistoryEntry] = []
+active_tasks: dict[int, "asyncio.Task[Any]"] = {}
 TELEGRAM_HEALTHCHECK_INTERVAL = 60
-TELEGRAM_MAX_UNHEALTHY_SECONDS = 300
+TELEGRAM_MAX_UNHEALTHY_SECONDS = 120
+HEARTBEAT_FILE = "/tmp/assistant-bot-alive"
 last_telegram_ok_at = time.monotonic()
 T = TypeVar("T")
 
@@ -88,9 +91,29 @@ def normalize_proxy_environment() -> None:
         os.environ["HTTPS_PROXY"] = https_proxy
 
 
+def _sd_notify(msg: str) -> None:
+    """Отправляет уведомление systemd через NOTIFY_SOCKET (если доступен)."""
+    sock_path = os.environ.get("NOTIFY_SOCKET", "")
+    if not sock_path:
+        return
+    if sock_path.startswith("@"):
+        sock_path = "\0" + sock_path[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(sock_path)
+            sock.send(msg.encode())
+    except Exception:
+        pass
+
+
 def mark_telegram_ok() -> None:
     global last_telegram_ok_at
     last_telegram_ok_at = time.monotonic()
+    try:
+        with open(HEARTBEAT_FILE, "w") as f:
+            f.write(str(last_telegram_ok_at))
+    except Exception:
+        pass
 
 
 def require_user(update: Update) -> User:
@@ -134,6 +157,9 @@ def build_prompt(user_text: str) -> str:
 CLAUDE_TIMEOUT = 600
 MAX_MSG_LEN = 4000
 PROGRESS_INTERVAL = 30
+CANCEL_CALLBACK = "cancel_request"
+CANCEL_KB = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=CANCEL_CALLBACK)]])
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
 
 
 async def send_response(msg: Message, text: str, prefix: str = "✅ ") -> None:
@@ -150,22 +176,34 @@ async def send_response(msg: Message, text: str, prefix: str = "✅ ") -> None:
 async def run_with_progress(coro: Awaitable[T], msg: Message, prefix: str = "") -> T:
     # Обёртка нужна, чтобы длинные операции не выглядели как зависание бота.
     task: asyncio.Task[T] = asyncio.ensure_future(coro)
+    chat_id = msg.chat_id
+    active_tasks[chat_id] = task  # type: ignore[assignment]
     elapsed = 0
     dots = ["⏳", "⌛"]
     i = 0
-    while not task.done():
+    try:
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=PROGRESS_INTERVAL)
-        except asyncio.TimeoutError:
-            elapsed += PROGRESS_INTERVAL
-            try:
-                await msg.edit_text(f"{dots[i % 2]} {prefix}Выполняю... ({elapsed}с)")
-            except Exception:
-                pass
-            i += 1
+            await msg.edit_text(f"⏳ {prefix}Выполняю...", reply_markup=CANCEL_KB)
         except Exception:
-            break
-    return await task
+            pass
+        while not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=PROGRESS_INTERVAL)
+            except asyncio.TimeoutError:
+                elapsed += PROGRESS_INTERVAL
+                try:
+                    await msg.edit_text(
+                        f"{dots[i % 2]} {prefix}Выполняю... ({elapsed}с)",
+                        reply_markup=CANCEL_KB,
+                    )
+                except Exception:
+                    pass
+                i += 1
+            except Exception:
+                break
+        return await task
+    finally:
+        active_tasks.pop(chat_id, None)
 
 
 async def _run_claude_proc(args: list[str]) -> str:
@@ -175,7 +213,15 @@ async def _run_claude_proc(args: list[str]) -> str:
         stderr=asyncio.subprocess.PIPE,
         cwd="/home/andrey/Projects/my-assistant",
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise
     response = stdout.decode("utf-8").strip()
     if not response and stderr:
         response = f"Ошибка: {stderr.decode('utf-8').strip()}"
@@ -242,6 +288,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info("Ответ claude: %s", response[:200])
         await send_response(msg, response, prefix=f"🎙 «{text}»\n\n✅ ")
 
+    except asyncio.CancelledError:
+        pass
     except asyncio.TimeoutError:
         await msg.edit_text("⏱ Превышено время ожидания. Попробуй ещё раз.")
     except Exception as exc:
@@ -280,6 +328,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info("Ответ claude: %s", response[:200])
         await send_response(msg, response)
 
+    except asyncio.CancelledError:
+        pass
     except asyncio.TimeoutError:
         await msg.edit_text("⏱ Превышено время ожидания.")
     except Exception as exc:
@@ -338,6 +388,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info("Ответ claude: %s", response[:200])
         await send_response(msg, response)
 
+    except asyncio.CancelledError:
+        pass
     except asyncio.TimeoutError:
         await msg.edit_text("⏱ Превышено время ожидания.")
     except Exception as exc:
@@ -370,6 +422,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         add_to_history(text, response)
         await send_response(msg, response)
 
+    except asyncio.CancelledError:
+        pass
     except asyncio.TimeoutError:
         await msg.edit_text("⏱ Превышено время ожидания.")
     except Exception as exc:
@@ -407,11 +461,89 @@ async def handle_any(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         response = await run_with_progress(run_claude(content), msg)
         add_to_history(content, response)
         await send_response(msg, response)
+    except asyncio.CancelledError:
+        pass
     except asyncio.TimeoutError:
         await msg.edit_text("⏱ Превышено время ожидания.")
     except Exception as exc:
         logger.exception("Ошибка обработки сообщения")
         await msg.edit_text(f"❌ Ошибка: {exc}")
+
+
+async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    user = update.effective_user
+    if user is None or user.id != ALLOWED_USER_ID:
+        return
+
+    chat_id = query.message.chat_id if query.message else None
+    if chat_id is None:
+        return
+
+    task = active_tasks.get(chat_id)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await query.edit_message_text("🚫 Запрос отменён.")
+        except Exception:
+            pass
+    else:
+        try:
+            await query.edit_message_text("⚠️ Нет активного запроса.")
+        except Exception:
+            pass
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = require_user(update)
+    if user.id != ALLOWED_USER_ID:
+        return
+
+    message = require_message(update)
+    document = message.document
+    if document is None:
+        return
+
+    logger.info("Документ от %s (%s): %s", user.id, user.username, document.file_name)
+    msg = await message.reply_text("📎 Скачиваю файл...")
+
+    file_name = document.file_name or "file"
+    ext = os.path.splitext(file_name)[1].lower()
+    caption = message.caption or "Прочитай файл и выполни задание если есть, иначе кратко опиши содержимое."
+
+    tg_file = await context.bot.get_file(document.file_id)
+
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        await tg_file.download_to_drive(tmp_path)
+
+        if ext in IMAGE_EXTENSIONS:
+            response = await run_with_progress(run_claude_vision(caption, image_path=tmp_path), msg)
+        else:
+            prompt = f"Файл «{file_name}» сохранён в {tmp_path}. {caption}"
+            response = await run_with_progress(run_claude(prompt), msg)
+
+        add_to_history(f"[файл: {file_name}] {caption}", response)
+        logger.info("Ответ claude: %s", response[:200])
+        await send_response(msg, response)
+
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        await msg.edit_text("⏱ Превышено время ожидания.")
+    except Exception as exc:
+        logger.exception("Ошибка обработки документа")
+        await msg.edit_text(f"❌ Ошибка: {exc}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -439,11 +571,17 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def telegram_watchdog(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
     # Если Telegram API недоступен слишком долго, принудительно завершаем процесс.
     # Дальше восстановлением занимается systemd через Restart=always.
+    #
+    # ВАЖНО: не используем asyncio.wait_for() — в Python 3.10 + anyio/httpx
+    # отмена coroutine через wait_for оставляет event loop в сломанном состоянии.
+    # Таймауты httpx (read_timeout=90s) достаточны и работают корректно.
+    # Внешний cron-watchdog перезапустит процесс если event loop всё же зависнет.
     while True:
         await asyncio.sleep(TELEGRAM_HEALTHCHECK_INTERVAL)
         try:
             await app.bot.get_me()
             mark_telegram_ok()
+            _sd_notify("WATCHDOG=1")
         except Exception:
             unhealthy_for = int(time.monotonic() - last_telegram_ok_at)
             logger.exception(
@@ -463,6 +601,12 @@ async def post_init(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
     # запускаем фоновый watchdog.
     await app.bot.get_me()
     mark_telegram_ok()
+    from telegram import BotCommand
+    await app.bot.set_my_commands([
+        BotCommand("start", "Информация о боте"),
+        BotCommand("new", "Начать новый разговор (очистить историю)"),
+    ])
+    _sd_notify("READY=1")
     app.bot_data["watchdog_task"] = asyncio.create_task(telegram_watchdog(app))
     logger.info("Watchdog Telegram API запущен.")
 
@@ -495,9 +639,11 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("new", handle_new))
+    app.add_handler(CallbackQueryHandler(handle_cancel, pattern=f"^{CANCEL_CALLBACK}$"))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.ALL, handle_any))
 
