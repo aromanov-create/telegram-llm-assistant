@@ -7,6 +7,7 @@ Telegram-бот ассистент Андрея.
 
 import asyncio
 import datetime
+import json
 import logging
 import os
 import socket
@@ -162,15 +163,33 @@ CANCEL_KB = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
 
 
+async def run_claude_cancellable(coro: "Awaitable[str]", chat_id: int) -> str:
+    task: asyncio.Task[str] = asyncio.ensure_future(coro)
+    active_tasks[chat_id] = task
+    try:
+        return await task
+    finally:
+        active_tasks.pop(chat_id, None)
+
+
 async def send_response(msg: Message, text: str, prefix: str = "✅ ") -> None:
     full = prefix + text
     if len(full) <= MAX_MSG_LEN:
-        await msg.edit_text(full)
+        try:
+            await msg.edit_text(full, parse_mode="Markdown")
+        except Exception:
+            await msg.edit_text(full)
         return
 
-    await msg.edit_text(full[:MAX_MSG_LEN])
+    try:
+        await msg.edit_text(full[:MAX_MSG_LEN], parse_mode="Markdown")
+    except Exception:
+        await msg.edit_text(full[:MAX_MSG_LEN])
     for i in range(MAX_MSG_LEN, len(full), MAX_MSG_LEN):
-        await msg.reply_text(full[i:i + MAX_MSG_LEN])
+        try:
+            await msg.reply_text(full[i:i + MAX_MSG_LEN], parse_mode="Markdown")
+        except Exception:
+            await msg.reply_text(full[i:i + MAX_MSG_LEN])
 
 
 async def run_with_progress(coro: Awaitable[T], msg: Message, prefix: str = "") -> T:
@@ -206,41 +225,110 @@ async def run_with_progress(coro: Awaitable[T], msg: Message, prefix: str = "") 
         active_tasks.pop(chat_id, None)
 
 
-async def _run_claude_proc(args: list[str]) -> str:
+STREAM_UPDATE_INTERVAL = 4  # секунд между обновлениями превью
+
+
+def _extract_progress(event: dict) -> str:
+    """Извлекает текст для превью из одного stream-json события."""
+    t = event.get("type")
+    if t == "assistant":
+        parts = []
+        for block in event.get("message", {}).get("content", []):
+            if block.get("type") == "text":
+                parts.append(block["text"])
+        return "".join(parts)
+    if t == "tool_use":
+        name = event.get("name", "")
+        inp = event.get("input", {})
+        if name == "Bash":
+            cmd = str(inp.get("command", ""))[:120]
+            return f"\n[Bash] {cmd}\n"
+        return f"\n[{name}]\n"
+    return ""
+
+
+async def _run_claude_streaming(args: list[str], progress_msg: Message | None = None) -> str:
+    # --output-format stream-json даёт реальный стриминг событий построчно
+    streaming_args = [args[0], "--output-format", "stream-json", "--verbose"] + args[1:]
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["LANG"] = "C.UTF-8"
+    env["LC_ALL"] = "C.UTF-8"
     proc = await asyncio.create_subprocess_exec(
-        *args,
+        *streaming_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd="/home/andrey/Projects/my-assistant",
+        env=env,
     )
+    progress_text = ""
+    final_result = ""
+    last_update = time.monotonic()
+
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
+        assert proc.stdout is not None
+        async for raw_line in proc.stdout:
+            if time.monotonic() - (last_update - CLAUDE_TIMEOUT) > CLAUDE_TIMEOUT:
+                # общий дедлайн
+                pass
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if event.get("type") == "result":
+                final_result = event.get("result", "")
+                continue
+
+            chunk = _extract_progress(event)
+            if chunk:
+                progress_text += chunk
+
+            if progress_msg is not None and progress_text.strip():
+                now = time.monotonic()
+                if now - last_update >= STREAM_UPDATE_INTERVAL:
+                    preview = progress_text.strip()[-1500:]
+                    try:
+                        await progress_msg.edit_text(f"⏳ Думаю...\n\n{preview}", reply_markup=CANCEL_KB)
+                    except Exception:
+                        pass
+                    last_update = now
+
+        await proc.wait()
+    except asyncio.CancelledError:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
         await proc.wait()
         raise
-    response = stdout.decode("utf-8").strip()
-    if not response and stderr:
-        response = f"Ошибка: {stderr.decode('utf-8').strip()}"
-    return response
+
+    result = final_result.strip() or progress_text.strip()
+    if not result:
+        assert proc.stderr is not None
+        stderr = await proc.stderr.read()
+        result = f"Ошибка: {stderr.decode('utf-8').strip()}" if stderr else "Нет ответа"
+    return result
 
 
-async def run_claude(prompt: str) -> str:
+async def run_claude(prompt: str, progress_msg: Message | None = None) -> str:
     full_prompt = build_prompt(prompt)
-    return await _run_claude_proc(
-        ["/home/andrey/.local/bin/claude", "--print", "--dangerously-skip-permissions", full_prompt]
+    return await _run_claude_streaming(
+        ["/home/andrey/.local/bin/claude", "--print", "--dangerously-skip-permissions", full_prompt],
+        progress_msg=progress_msg,
     )
 
 
-async def run_claude_vision(prompt: str, image_path: str) -> str:
+async def run_claude_vision(prompt: str, image_path: str, progress_msg: Message | None = None) -> str:
     full_prompt = build_prompt(
         f"Изображение сохранено в файл: {image_path}\nПрочитай этот файл и выполни задание.\n{prompt}"
     )
-    return await _run_claude_proc(
-        ["/home/andrey/.local/bin/claude", "--print", "--dangerously-skip-permissions", full_prompt]
+    return await _run_claude_streaming(
+        ["/home/andrey/.local/bin/claude", "--print", "--dangerously-skip-permissions", full_prompt],
+        progress_msg=progress_msg,
     )
 
 
@@ -281,9 +369,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text = result["text"].strip()
         logger.info("Транскрипция: %s", text)
 
-        await msg.edit_text(f"🎙 «{text}»\n\n⏳ Выполняю...")
+        await msg.edit_text(f"🎙 «{text}»\n\n⏳ Думаю...", reply_markup=CANCEL_KB)
 
-        response = await run_with_progress(run_claude(text), msg, prefix=f"🎙 «{text}»\n\n")
+        response = await run_claude_cancellable(run_claude(text, progress_msg=msg), message.chat_id)
         add_to_history(text, response)
         logger.info("Ответ claude: %s", response[:200])
         await send_response(msg, response, prefix=f"🎙 «{text}»\n\n✅ ")
@@ -323,7 +411,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         await tg_file.download_to_drive(tmp_path)
 
-        response = await run_with_progress(run_claude_vision(caption, image_path=tmp_path), msg)
+        await msg.edit_text("⏳ Думаю...", reply_markup=CANCEL_KB)
+        response = await run_claude_cancellable(run_claude_vision(caption, image_path=tmp_path, progress_msg=msg), message.chat_id)
         add_to_history(f"[фото] {caption}", response)
         logger.info("Ответ claude: %s", response[:200])
         await send_response(msg, response)
@@ -383,7 +472,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await msg.edit_text("❌ Не удалось извлечь кадр из видео.")
             return
 
-        response = await run_with_progress(run_claude_vision(caption, image_path=frame_path), msg)
+        await msg.edit_text("⏳ Думаю...", reply_markup=CANCEL_KB)
+        response = await run_claude_cancellable(run_claude_vision(caption, image_path=frame_path, progress_msg=msg), message.chat_id)
         add_to_history(f"[видео] {caption}", response)
         logger.info("Ответ claude: %s", response[:200])
         await send_response(msg, response)
@@ -415,10 +505,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = text.strip()
     logger.info("Текст от %s: %s", user.id, text)
 
-    msg = await message.reply_text("⏳ Выполняю...")
+    msg = await message.reply_text("⏳ Думаю...", reply_markup=CANCEL_KB)
 
     try:
-        response = await run_with_progress(run_claude(text), msg)
+        response = await run_claude_cancellable(run_claude(text, progress_msg=msg), message.chat_id)
         add_to_history(text, response)
         await send_response(msg, response)
 
@@ -455,10 +545,10 @@ async def handle_any(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     logger.info("Прочее сообщение от %s: %s", user.id, content[:100])
-    msg = await message.reply_text("⏳ Выполняю...")
+    msg = await message.reply_text("⏳ Думаю...", reply_markup=CANCEL_KB)
 
     try:
-        response = await run_with_progress(run_claude(content), msg)
+        response = await run_claude_cancellable(run_claude(content, progress_msg=msg), message.chat_id)
         add_to_history(content, response)
         await send_response(msg, response)
     except asyncio.CancelledError:
@@ -524,11 +614,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         await tg_file.download_to_drive(tmp_path)
 
+        await msg.edit_text("⏳ Думаю...", reply_markup=CANCEL_KB)
         if ext in IMAGE_EXTENSIONS:
-            response = await run_with_progress(run_claude_vision(caption, image_path=tmp_path), msg)
+            response = await run_claude_cancellable(run_claude_vision(caption, image_path=tmp_path, progress_msg=msg), message.chat_id)
         else:
             prompt = f"Файл «{file_name}» сохранён в {tmp_path}. {caption}"
-            response = await run_with_progress(run_claude(prompt), msg)
+            response = await run_claude_cancellable(run_claude(prompt, progress_msg=msg), message.chat_id)
 
         add_to_history(f"[файл: {file_name}] {caption}", response)
         logger.info("Ответ claude: %s", response[:200])
