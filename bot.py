@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram-бот ассистент Андрея.
+Telegram-бот личный ассистент.
 Принимает голосовые сообщения -> транскрибирует Whisper -> выполняет через claude CLI.
 Поддерживает текст, фото и видео.
 """
@@ -10,6 +10,7 @@ import datetime
 import json
 import logging
 import os
+import pathlib
 import socket
 import tempfile
 import time
@@ -30,13 +31,19 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BOT_TOKEN_RAW = os.environ.get("BOT_TOKEN")
 ALLOWED_USER_ID_RAW = os.environ.get("ALLOWED_USER_ID")
+USER_NAME_RAW = os.environ.get("USER_NAME", "пользователь")
+CLAUDE_PATH_RAW = os.environ.get("CLAUDE_PATH")
 
 if not BOT_TOKEN_RAW:
     raise RuntimeError("BOT_TOKEN is required in environment")
 if not ALLOWED_USER_ID_RAW:
     raise RuntimeError("ALLOWED_USER_ID is required in environment")
+if not CLAUDE_PATH_RAW:
+    raise RuntimeError("CLAUDE_PATH is required in environment")
 
 BOT_TOKEN: str = BOT_TOKEN_RAW
+CLAUDE_PATH: str = CLAUDE_PATH_RAW
+USER_NAME: str = USER_NAME_RAW
 
 try:
     ALLOWED_USER_ID = int(ALLOWED_USER_ID_RAW)
@@ -47,9 +54,10 @@ logger.info("Загружаю модель Whisper...")
 whisper_model = whisper.load_model("large-v3")
 logger.info("Whisper готов.")
 
-SYSTEM_PROMPT = """Ты личный ассистент Андрея Романова. Тебе передаётся запрос.
-Выполни то, о чём просит Андрей: поставить задачу в трекер, посмотреть задачи, отправить письмо и т.д.
+SYSTEM_PROMPT = """Ты личный ассистент {user_name}. Тебе передаётся запрос.
+Выполни то, о чём просит {user_name}: поставить задачу в трекер, посмотреть задачи, отправить письмо и т.д.
 Отвечай кратко - только результат действия или ответ на вопрос.
+Думай и рассуждай ТОЛЬКО на русском языке.
 Дата сегодня: {date}.
 """
 
@@ -68,8 +76,10 @@ conversation_history: list[HistoryEntry] = []
 active_tasks: dict[int, "asyncio.Task[Any]"] = {}
 TELEGRAM_HEALTHCHECK_INTERVAL = 60
 TELEGRAM_MAX_UNHEALTHY_SECONDS = 120
+POLLING_MAX_UNHEALTHY_SECONDS = 300  # 5 минут без успешного getUpdates → перезапуск
 HEARTBEAT_FILE = "/tmp/assistant-bot-alive"
 last_telegram_ok_at = time.monotonic()
+last_get_updates_ok = time.monotonic()
 T = TypeVar("T")
 
 
@@ -142,17 +152,17 @@ def add_to_history(user_text: str, assistant_text: str) -> None:
 
 def build_prompt(user_text: str) -> str:
     today = datetime.date.today().isoformat()
-    system = SYSTEM_PROMPT.format(date=today)
+    system = SYSTEM_PROMPT.format(date=today, user_name=USER_NAME)
 
     history_block = ""
     if conversation_history:
         lines: list[str] = []
         for msg in conversation_history[-MAX_HISTORY:]:
-            role = "Андрей" if msg["role"] == "user" else "Ассистент"
+            role = USER_NAME if msg["role"] == "user" else "Ассистент"
             lines.append(f"{role}: {msg['text']}")
         history_block = "История разговора:\n" + "\n".join(lines) + "\n\n"
 
-    return f"{system}\n\n{history_block}Запрос: {user_text}"
+    return f"{system}\n\n{history_block}ВАЖНО: все рассуждения, мысли и thinking веди ТОЛЬКО на русском языке.\n\nЗапрос: {user_text}"
 
 
 CLAUDE_TIMEOUT = 600
@@ -225,7 +235,7 @@ async def run_with_progress(coro: Awaitable[T], msg: Message, prefix: str = "") 
         active_tasks.pop(chat_id, None)
 
 
-STREAM_UPDATE_INTERVAL = 4  # секунд между обновлениями превью
+STREAM_UPDATE_INTERVAL = 2  # секунд между обновлениями превью
 
 
 def _extract_progress(event: dict) -> str:
@@ -234,16 +244,46 @@ def _extract_progress(event: dict) -> str:
     if t == "assistant":
         parts = []
         for block in event.get("message", {}).get("content", []):
-            if block.get("type") == "text":
+            bt = block.get("type")
+            if bt == "text":
                 parts.append(block["text"])
+            elif bt == "thinking":
+                thinking = block.get("thinking", "")[:300]
+                parts.append(f"💭 {thinking}\n")
+            elif bt == "tool_use":
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                if name == "Bash":
+                    cmd = str(inp.get("command", ""))[:150]
+                    parts.append(f"\n🔧 `{cmd}`\n")
+                elif name in ("Read", "Write", "Edit"):
+                    path = str(inp.get("file_path", ""))
+                    icons = {"Read": "📖", "Write": "✏️", "Edit": "✏️"}
+                    parts.append(f"\n{icons[name]} {name}: {path}\n")
+                elif name == "Glob":
+                    parts.append(f"\n🔍 Glob: {inp.get('pattern', '')}\n")
+                elif name == "Grep":
+                    parts.append(f"\n🔍 Grep: {inp.get('pattern', '')}\n")
+                elif name in ("WebFetch", "WebSearch"):
+                    val = str(inp.get("url", inp.get("query", "")))[:80]
+                    parts.append(f"\n🌐 {name}: {val}\n")
+                else:
+                    parts.append(f"\n🔧 {name}\n")
         return "".join(parts)
-    if t == "tool_use":
-        name = event.get("name", "")
-        inp = event.get("input", {})
-        if name == "Bash":
-            cmd = str(inp.get("command", ""))[:120]
-            return f"\n[Bash] {cmd}\n"
-        return f"\n[{name}]\n"
+    if t == "user":
+        # результат выполнения инструмента (вывод команды и т.д.)
+        for block in event.get("message", {}).get("content", []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result":
+                content = block.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    return f"\n📤 {content.strip()[:300]}\n"
+                if isinstance(content, list):
+                    texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                    combined = "\n".join(texts).strip()[:300]
+                    if combined:
+                        return f"\n📤 {combined}\n"
     return ""
 
 
@@ -258,19 +298,32 @@ async def _run_claude_streaming(args: list[str], progress_msg: Message | None = 
         *streaming_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd="/home/andrey/Projects/my-assistant",
+        cwd=str(pathlib.Path(__file__).parent),
         env=env,
     )
     progress_text = ""
     final_result = ""
     last_update = time.monotonic()
 
+    deadline = time.monotonic() + CLAUDE_TIMEOUT
     try:
         assert proc.stdout is not None
-        async for raw_line in proc.stdout:
-            if time.monotonic() - (last_update - CLAUDE_TIMEOUT) > CLAUDE_TIMEOUT:
-                # общий дедлайн
-                pass
+        while True:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                proc.kill()
+                await proc.wait()
+                raise asyncio.TimeoutError()
+            try:
+                raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=min(timeout, 30))
+            except asyncio.TimeoutError:
+                if time.monotonic() >= deadline:
+                    proc.kill()
+                    await proc.wait()
+                    raise asyncio.TimeoutError()
+                continue
+            if not raw_line:
+                break
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -317,7 +370,7 @@ async def _run_claude_streaming(args: list[str], progress_msg: Message | None = 
 async def run_claude(prompt: str, progress_msg: Message | None = None) -> str:
     full_prompt = build_prompt(prompt)
     return await _run_claude_streaming(
-        ["/home/andrey/.local/bin/claude", "--print", "--dangerously-skip-permissions", full_prompt],
+        [CLAUDE_PATH, "--print", "--dangerously-skip-permissions", full_prompt],
         progress_msg=progress_msg,
     )
 
@@ -327,7 +380,7 @@ async def run_claude_vision(prompt: str, image_path: str, progress_msg: Message 
         f"Изображение сохранено в файл: {image_path}\nПрочитай этот файл и выполни задание.\n{prompt}"
     )
     return await _run_claude_streaming(
-        ["/home/andrey/.local/bin/claude", "--print", "--dangerously-skip-permissions", full_prompt],
+        [CLAUDE_PATH, "--print", "--dangerously-skip-permissions", full_prompt],
         progress_msg=progress_msg,
     )
 
@@ -686,6 +739,17 @@ async def telegram_watchdog(app: Application[Any, Any, Any, Any, Any, Any]) -> N
                 )
                 os._exit(1)
 
+        # Проверяем что polling не завис: getUpdates должен отвечать регулярно.
+        # get_me() работает даже при зависшем polling (разные httpx-клиенты),
+        # поэтому нужна отдельная проверка.
+        polling_stuck_for = int(time.monotonic() - last_get_updates_ok)
+        if polling_stuck_for >= POLLING_MAX_UNHEALTHY_SECONDS:
+            logger.error(
+                "Polling завис: нет успешного getUpdates уже %sс, перезапуск",
+                polling_stuck_for,
+            )
+            os._exit(1)
+
 
 async def post_init(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
     # Сначала проверяем, что Telegram доступен на старте, и только потом
@@ -697,6 +761,7 @@ async def post_init(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         BotCommand("start", "Информация о боте"),
         BotCommand("new", "Начать новый разговор (очистить историю)"),
     ])
+
     _sd_notify("READY=1")
     app.bot_data["watchdog_task"] = asyncio.create_task(telegram_watchdog(app))
     logger.info("Watchdog Telegram API запущен.")
@@ -712,6 +777,30 @@ async def post_shutdown(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
             pass
 
 
+def _build_get_updates_request() -> Any:
+    """Создаёт HTTPXRequest для getUpdates с отслеживанием успешных ответов.
+
+    PTB использует отдельный httpx-клиент для getUpdates (не тот, что для get_me и пр.),
+    поэтому get_me() работает даже когда polling завис. Вешаем event hook на ответ:
+    каждый успешный getUpdates обновляет last_get_updates_ok.
+    При зависании цикла TimedOut этот хук не вызывается → watchdog обнаруживает проблему.
+    """
+    import httpx
+    from telegram.request import HTTPXRequest
+
+    async def _on_response(response: httpx.Response) -> None:
+        global last_get_updates_ok
+        if b"getUpdates" in bytes(str(response.request.url), "utf-8"):
+            last_get_updates_ok = time.monotonic()
+
+    return HTTPXRequest(
+        connection_pool_size=1,
+        read_timeout=15,
+        connect_timeout=15,
+        httpx_kwargs={"event_hooks": {"response": [_on_response]}},
+    )
+
+
 def main() -> None:
     normalize_proxy_environment()
     app = (
@@ -722,6 +811,7 @@ def main() -> None:
         .read_timeout(90)
         .write_timeout(90)
         .pool_timeout(120)
+        .get_updates_request(_build_get_updates_request())
         .concurrent_updates(False)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
