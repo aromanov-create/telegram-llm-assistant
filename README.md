@@ -101,6 +101,12 @@ cp assistant-bot.env.example assistant-bot.env
 BOT_TOKEN=<telegram bot token>
 ALLOWED_USER_ID=<telegram user id>
 
+# Имя пользователя — подставляется в system prompt и историю разговора
+USER_NAME=Имя
+
+# Абсолютный путь к бинарнику claude CLI
+CLAUDE_PATH=/home/username/.local/bin/claude
+
 # Optional proxy settings
 # http_proxy=http://127.0.0.1:8118
 # https_proxy=http://127.0.0.1:8118
